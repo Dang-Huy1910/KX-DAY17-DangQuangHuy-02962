@@ -16,60 +16,109 @@ class SessionState:
 
 
 class BaselineAgent:
-    """Student TODO: implement Agent A.
-
-    Requirements:
-    - Within-session memory only
-    - No persistent `User.md`
-    - Should forget long-term facts across new threads
-    """
+    """Agent A: within-thread memory only. New thread_id => facts are gone."""
 
     def __init__(self, config: LabConfig | None = None, force_offline: bool = False) -> None:
         self.config = config or load_config()
         self.force_offline = force_offline
         self.sessions: dict[str, SessionState] = {}
-
-        # TODO: optionally initialize a real LangChain/LangGraph agent when dependencies exist.
-        self.langchain_agent = None
+        self.langchain_agent = None if force_offline else self._maybe_build_langchain_agent()
 
     def reply(self, user_id: str, thread_id: str, message: str) -> dict[str, Any]:
-        """Student TODO: return the agent response and token accounting.
-
-        Pseudocode:
-        - If a live agent exists, call the live path.
-        - Otherwise use a deterministic offline path.
-        """
-
-        raise NotImplementedError
+        del user_id  # Baseline intentionally ignores long-term user identity.
+        if self.langchain_agent is not None:
+            try:
+                return self._reply_live(thread_id, message)
+            except Exception:
+                pass
+        return self._reply_offline(thread_id, message)
 
     def token_usage(self, thread_id: str) -> int:
-        # TODO: return cumulative agent token count for one thread.
-        raise NotImplementedError
+        session = self.sessions.get(thread_id)
+        return 0 if session is None else session.token_usage
 
     def prompt_token_usage(self, thread_id: str) -> int:
-        # TODO: estimate how much prompt context this baseline kept processing.
-        raise NotImplementedError
+        session = self.sessions.get(thread_id)
+        return 0 if session is None else session.prompt_tokens_processed
 
     def compaction_count(self, thread_id: str) -> int:
-        # Baseline has no compact memory.
         return 0
 
+    def memory_file_size(self, user_id: str) -> int:
+        del user_id
+        return 0
+
+    def _session(self, thread_id: str) -> SessionState:
+        return self.sessions.setdefault(thread_id, SessionState())
+
     def _reply_offline(self, thread_id: str, message: str) -> dict[str, Any]:
-        """Student TODO: implement a simple offline behavior.
+        session = self._session(thread_id)
+        session.messages.append({"role": "user", "content": message})
+        session.prompt_tokens_processed += estimate_tokens(
+            "\n".join(item["content"] for item in session.messages)
+        )
+        answer = self._offline_response(session, message)
+        session.messages.append({"role": "assistant", "content": answer})
+        session.token_usage += estimate_tokens(answer)
+        return {"answer": answer, "thread_id": thread_id}
 
-        Suggested behavior:
-        - Store the new user message in the session
-        - Generate a short deterministic reply
-        - Update token counts
-        - Never remember facts across different thread ids
-        """
+    def _offline_response(self, session: SessionState, message: str) -> str:
+        prior_user = [
+            item["content"] for item in session.messages[:-1] if item["role"] == "user"
+        ]
+        if not prior_user:
+            return (
+                "Mình chưa có bộ nhớ dài hạn giữa các phiên. "
+                "Trong thread mới này mình chưa nhớ tên, nghề nghiệp hay sở thích của bạn."
+            )
+        blob = "\n".join(prior_user)
+        return (
+            "Trong cùng thread này mình còn nhớ vài ý gần đây: "
+            + blob[-400:]
+        )
 
-        raise NotImplementedError
+    def _reply_live(self, thread_id: str, message: str) -> dict[str, Any]:
+        session = self._session(thread_id)
+        session.messages.append({"role": "user", "content": message})
+        session.prompt_tokens_processed += estimate_tokens(
+            "\n".join(item["content"] for item in session.messages)
+        )
+        result = self.langchain_agent.invoke(
+            {"messages": [{"role": "user", "content": message}]},
+            config={"configurable": {"thread_id": thread_id}},
+        )
+        answer = _content_from_langchain(result)
+        session.messages.append({"role": "assistant", "content": answer})
+        session.token_usage += estimate_tokens(answer)
+        return {"answer": answer, "thread_id": thread_id}
 
     def _maybe_build_langchain_agent(self):
-        """Student TODO: optionally wire `create_agent` + `InMemorySaver` here.
+        """Optional live path: create_agent + InMemorySaver for the chosen provider."""
 
-        Use `build_chat_model(self.config.model)` so the baseline can run with any supported provider.
-        """
+        provider = self.config.model.provider
+        if provider not in {"ollama", "custom"} and not self.config.model.api_key:
+            return None
+        try:
+            from langchain.agents import create_agent
+            from langgraph.checkpoint.memory import InMemorySaver
 
-        raise NotImplementedError
+            model = build_chat_model(self.config.model)
+            return create_agent(
+                model,
+                tools=[],
+                checkpointer=InMemorySaver(),
+                system_prompt=(
+                    "Bạn là trợ lý chỉ nhớ ngữ cảnh trong cùng một thread. "
+                    "Không bịa thông tin dài hạn từ các phiên khác."
+                ),
+            )
+        except Exception:
+            return None
+
+
+def _content_from_langchain(result: Any) -> str:
+    if isinstance(result, dict) and "messages" in result:
+        last = result["messages"][-1]
+        content = getattr(last, "content", last)
+        return str(content)
+    return str(result)
